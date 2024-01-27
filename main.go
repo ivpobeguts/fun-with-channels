@@ -13,6 +13,7 @@ import (
 type TradeData struct {
 	Price     float64 `json:"p"`
 	Timestamp int64   `json:"t"`
+	Symbol    string  `json:"s"`
 }
 
 type APIResponse struct {
@@ -20,12 +21,14 @@ type APIResponse struct {
 	Type string      `json:"type"`
 }
 
-type ThreadSafeSortedSlice struct {
-	slice []TradeData
-	mu    sync.Mutex
+type ThreadSafeCryptoBatch struct {
+	slice      []TradeData
+	mu         sync.Mutex
+	windowSize int
+	sum        float64
 }
 
-func (tss *ThreadSafeSortedSlice) InsertSorted(item TradeData) {
+func (tss *ThreadSafeCryptoBatch) InsertSorted(item TradeData) {
 	// Binary search to find the correct position based on timestamp
 	index := sort.Search(len(tss.slice), func(i int) bool {
 		return tss.slice[i].Timestamp >= item.Timestamp
@@ -37,11 +40,16 @@ func (tss *ThreadSafeSortedSlice) InsertSorted(item TradeData) {
 
 func main() {
 	apiKey := "cmpois1r01qg7bbococ0cmpois1r01qg7bbococg"
+	windowSize := 60
 
-	apiDataChan := make(chan TradeData)
-	printerChan := make(chan float64)
+	btcChan := make(chan TradeData)
+	ethChan := make(chan TradeData)
+	ltcChan := make(chan TradeData)
+	printerChan := make(chan map[string]float64)
 	var wg sync.WaitGroup
-	windowBatch := &ThreadSafeSortedSlice{}
+	btcWindowBatch := &ThreadSafeCryptoBatch{windowSize: windowSize, slice: make([]TradeData, 0), sum: 0}
+	ethWindowBatch := &ThreadSafeCryptoBatch{windowSize: windowSize, slice: make([]TradeData, 0), sum: 0}
+	ltcWindowBatch := &ThreadSafeCryptoBatch{windowSize: windowSize, slice: make([]TradeData, 0), sum: 0}
 
 	w, _, err := websocket.DefaultDialer.Dial(fmt.Sprintf("wss://ws.finnhub.io?token=%s", apiKey), nil)
 	if err != nil {
@@ -49,11 +57,13 @@ func main() {
 	}
 	defer w.Close()
 
-	symbols := []string{"BINANCE:BTCUSDT"}
+	symbols := []string{"BINANCE:BTCUSDT", "BINANCE:ETHUSDT", "BINANCE:LTCUSDT"}
 	for _, s := range symbols {
 		msg, _ := json.Marshal(map[string]interface{}{"type": "subscribe", "symbol": s})
 		w.WriteMessage(websocket.TextMessage, msg)
 	}
+
+	log.Println("Wating for first {1} values to calculate the first window", windowSize)
 
 	wg.Add(1)
 	go func() {
@@ -71,43 +81,36 @@ func main() {
 				continue
 			}
 
-			// Send to channel
-			if apiResponse.Type == "trade" {
-				apiDataChan <- apiResponse.Data[0]
+			if len(apiResponse.Data) == 0 {
+				log.Println("Empty trade data")
+				continue
 			}
 
-			// Print message
-			// for _, tradeData := range apiResponse.Data {
-			// 	fmt.Printf("Price: %f, Symbol: %s, Timestamp: %d, Volume: %f\n",
-			// 		tradeData.Price, tradeData.Symbol, tradeData.Timestamp, tradeData.Volume)
-			// }
-
+			// Send to channel
+			if apiResponse.Type == "trade" {
+				for _, data := range apiResponse.Data {
+					switch data.Symbol {
+					case "BINANCE:BTCUSDT":
+						btcChan <- data
+					case "BINANCE:ETHUSDT":
+						ethChan <- data
+					case "BINANCE:LTCUSDT":
+						ltcChan <- data
+					}
+				}
+			}
 		}
 	}()
 
 	// Goroutine for batch processing
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		batchSize := 10
-		batchSum := 0.0
-		average := 0.0
+	go processCryptoData("BTC", btcChan, printerChan, btcWindowBatch, &wg)
 
-		for {
-			apiData := <-apiDataChan
-			windowBatch.mu.Lock()
-			windowBatch.InsertSorted(apiData)
-			batchSum += apiData.Price
-			if len(windowBatch.slice) == batchSize {
-				average = batchSum / float64(batchSize)
-				windowBatch.slice = windowBatch.slice[1:]
-				batchSum -= windowBatch.slice[0].Price
+	wg.Add(1)
+	go processCryptoData("ETH", ethChan, printerChan, ethWindowBatch, &wg)
 
-				printerChan <- average
-			}
-			windowBatch.mu.Unlock()
-		}
-	}()
+	wg.Add(1)
+	go processCryptoData("LTC", ltcChan, printerChan, ltcWindowBatch, &wg)
 
 	// Goroutine for printing
 	wg.Add(1)
@@ -121,4 +124,23 @@ func main() {
 
 	// Wait for all goroutines to finish
 	wg.Wait()
+}
+
+func processCryptoData(symbol string, inputChan <-chan TradeData, printerChan chan<- map[string]float64, batch *ThreadSafeCryptoBatch, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	for {
+		apiData := <-inputChan
+		batch.mu.Lock()
+		batch.InsertSorted(apiData)
+		batch.sum += apiData.Price
+		if len(batch.slice) == batch.windowSize {
+			average := batch.sum / float64(batch.windowSize)
+			batch.slice = batch.slice[1:]
+			batch.sum -= batch.slice[0].Price
+
+			printerChan <- map[string]float64{symbol: average}
+		}
+		batch.mu.Unlock()
+	}
 }
