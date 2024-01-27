@@ -1,13 +1,16 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
+	_ "github.com/lib/pq"
 )
 
 type TradeData struct {
@@ -28,14 +31,49 @@ type ThreadSafeCryptoBatch struct {
 	sum        float64
 }
 
-func (tss *ThreadSafeCryptoBatch) InsertSorted(item TradeData) {
+type MovingAverage struct {
+	currency     string
+	value        float64
+	calculatedAt int64
+}
+
+func (batch *ThreadSafeCryptoBatch) InsertSorted(item TradeData) {
 	// Binary search to find the correct position based on timestamp
-	index := sort.Search(len(tss.slice), func(i int) bool {
-		return tss.slice[i].Timestamp >= item.Timestamp
+	index := sort.Search(len(batch.slice), func(i int) bool {
+		return batch.slice[i].Timestamp >= item.Timestamp
 	})
 
 	// Insert the item at the correct position
-	tss.slice = append(tss.slice[:index], append([]TradeData{item}, tss.slice[index:]...)...)
+	batch.slice = append(batch.slice[:index], append([]TradeData{item}, batch.slice[index:]...)...)
+}
+
+func calculateMovingAverage(currency string, inputChan <-chan TradeData, outputChan chan<- MovingAverage, batch *ThreadSafeCryptoBatch, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	for {
+		apiData := <-inputChan
+
+		batch.mu.Lock()
+
+		batch.InsertSorted(apiData)
+		batch.sum += apiData.Price
+		if len(batch.slice) == batch.windowSize {
+			average := batch.sum / float64(batch.windowSize)
+			batch.slice = batch.slice[1:]
+			batch.sum -= batch.slice[0].Price
+
+			outputChan <- MovingAverage{currency: currency, value: average, calculatedAt: batch.slice[len(batch.slice)-1].Timestamp}
+		}
+
+		batch.mu.Unlock()
+	}
+}
+
+func saveToDB(symbol string, average float64, calculatedAt int64, db *sql.DB) error {
+	_, err := db.Exec(`
+        INSERT INTO averages (symbol, average, calculated_at) VALUES ($1, $2, $3)
+    `, symbol, average, time.Unix(calculatedAt, 0))
+	return err
 }
 
 func main() {
@@ -45,7 +83,7 @@ func main() {
 	btcChan := make(chan TradeData)
 	ethChan := make(chan TradeData)
 	ltcChan := make(chan TradeData)
-	printerChan := make(chan map[string]float64)
+	dbChan := make(chan MovingAverage)
 	var wg sync.WaitGroup
 	btcWindowBatch := &ThreadSafeCryptoBatch{windowSize: windowSize, slice: make([]TradeData, 0), sum: 0}
 	ethWindowBatch := &ThreadSafeCryptoBatch{windowSize: windowSize, slice: make([]TradeData, 0), sum: 0}
@@ -57,14 +95,28 @@ func main() {
 	}
 	defer w.Close()
 
+	// PostgreSQL database connection
+	db, err := sql.Open("postgres", "host=postgres port=5432 user=postgres password=postgres dbname=postgres sslmode=disable")
+	if err != nil {
+		log.Fatal("Error opening database connection:", err)
+	}
+	defer db.Close()
+
+	// Check if the db connection is successful
+	err = db.Ping()
+	if err != nil {
+		log.Fatal("Error pinging database:", err)
+	}
+
 	symbols := []string{"BINANCE:BTCUSDT", "BINANCE:ETHUSDT", "BINANCE:LTCUSDT"}
 	for _, s := range symbols {
 		msg, _ := json.Marshal(map[string]interface{}{"type": "subscribe", "symbol": s})
 		w.WriteMessage(websocket.TextMessage, msg)
 	}
 
-	log.Println("Wating for first {1} values to calculate the first window", windowSize)
+	log.Printf("Wating for first %d values to calculate the first window", windowSize)
 
+	// Goroutine for getting the data
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -102,45 +154,30 @@ func main() {
 		}
 	}()
 
-	// Goroutine for batch processing
+	// Goroutines for batch processing
 	wg.Add(1)
-	go processCryptoData("BTC", btcChan, printerChan, btcWindowBatch, &wg)
+	go calculateMovingAverage("BTC", btcChan, dbChan, btcWindowBatch, &wg)
 
 	wg.Add(1)
-	go processCryptoData("ETH", ethChan, printerChan, ethWindowBatch, &wg)
+	go calculateMovingAverage("ETH", ethChan, dbChan, ethWindowBatch, &wg)
 
 	wg.Add(1)
-	go processCryptoData("LTC", ltcChan, printerChan, ltcWindowBatch, &wg)
+	go calculateMovingAverage("LTC", ltcChan, dbChan, ltcWindowBatch, &wg)
 
-	// Goroutine for printing
+	// Goroutine for saving to DB
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		for {
-			// Receive transformed data from the printer channel and print
-			fmt.Println(<-printerChan)
+			ma := <-dbChan
+
+			err := saveToDB(ma.currency, ma.value, ma.calculatedAt, db)
+			if err != nil {
+				log.Println("Error saving to database:", err)
+			}
 		}
 	}()
 
 	// Wait for all goroutines to finish
 	wg.Wait()
-}
-
-func processCryptoData(symbol string, inputChan <-chan TradeData, printerChan chan<- map[string]float64, batch *ThreadSafeCryptoBatch, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	for {
-		apiData := <-inputChan
-		batch.mu.Lock()
-		batch.InsertSorted(apiData)
-		batch.sum += apiData.Price
-		if len(batch.slice) == batch.windowSize {
-			average := batch.sum / float64(batch.windowSize)
-			batch.slice = batch.slice[1:]
-			batch.sum -= batch.slice[0].Price
-
-			printerChan <- map[string]float64{symbol: average}
-		}
-		batch.mu.Unlock()
-	}
 }
