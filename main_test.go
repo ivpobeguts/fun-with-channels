@@ -54,6 +54,7 @@ func TestCalculateMovingAverageOk(t *testing.T) {
 
 	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for _, data := range inputData {
 			inputChan <- data
 		}
@@ -79,4 +80,7 @@ func TestCalculateMovingAverageOk(t *testing.T) {
 			t.Errorf("Expected %v, but got %v", ma, result)
 		}
 	}
+
+	close(inputChan)
+	close(outputChan)
 }
