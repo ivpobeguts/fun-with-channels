@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -59,21 +60,63 @@ func calculateMovingAverage(currency string, inputChan <-chan TradeData, outputC
 		batch.sum += apiData.Price
 		if len(batch.slice) == batch.windowSize {
 			average := batch.sum / float64(batch.windowSize)
+			rounded_avg := math.Round(average*100) / 100
 			batch.slice = batch.slice[1:]
 			batch.sum -= batch.slice[0].Price
 
-			outputChan <- MovingAverage{currency: currency, value: average, calculatedAt: batch.slice[len(batch.slice)-1].Timestamp}
+			outputChan <- MovingAverage{currency: currency, value: rounded_avg, calculatedAt: batch.slice[len(batch.slice)-1].Timestamp}
 		}
 
 		batch.mu.Unlock()
 	}
 }
 
-func saveToDB(symbol string, average float64, calculatedAt int64, db *sql.DB) error {
-	_, err := db.Exec(`
-        INSERT INTO averages (symbol, average, calculated_at) VALUES ($1, $2, $3)
-    `, symbol, average, time.Unix(calculatedAt, 0))
-	return err
+func getCryptoData(w *websocket.Conn, btcChan, ethChan, ltcChan chan<- TradeData, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for {
+		// Unmarshal message
+		_, message, err := w.ReadMessage()
+		if err != nil {
+			log.Fatal("Error reading message from WebSocket:", err)
+		}
+		var apiResponse APIResponse
+		err = json.Unmarshal(message, &apiResponse)
+		if err != nil {
+			log.Println("Error unmarshalling JSON:", err)
+			continue
+		}
+
+		if len(apiResponse.Data) == 0 {
+			log.Println("Empty trade data")
+			continue
+		}
+
+		// Send to channel
+		if apiResponse.Type == "trade" {
+			for _, data := range apiResponse.Data {
+				switch data.Symbol {
+				case "BINANCE:BTCUSDT":
+					btcChan <- data
+				case "BINANCE:ETHUSDT":
+					ethChan <- data
+				case "BINANCE:LTCUSDT":
+					ltcChan <- data
+				}
+			}
+		}
+	}
+}
+
+func saveToDB(dbChan <-chan MovingAverage, db *sql.DB, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for {
+		ma := <-dbChan
+
+		_, err := db.Exec(`INSERT INTO averages (symbol, average, calculated_at) VALUES ($1, $2, $3)`, ma.currency, ma.value, time.Unix(ma.calculatedAt, 0))
+		if err != nil {
+			log.Println("Error saving to database:", err)
+		}
+	}
 }
 
 func main() {
@@ -96,6 +139,7 @@ func main() {
 	defer w.Close()
 
 	// PostgreSQL database connection
+	log.Println("Connecting to the Postgres DB...")
 	db, err := sql.Open("postgres", "host=postgres port=5432 user=postgres password=postgres dbname=postgres sslmode=disable")
 	if err != nil {
 		log.Fatal("Error opening database connection:", err)
@@ -103,6 +147,7 @@ func main() {
 	defer db.Close()
 
 	// Check if the db connection is successful
+	log.Println("Checking DB connection...")
 	err = db.Ping()
 	if err != nil {
 		log.Fatal("Error pinging database:", err)
@@ -114,45 +159,11 @@ func main() {
 		w.WriteMessage(websocket.TextMessage, msg)
 	}
 
-	log.Printf("Wating for first %d values to calculate the first window", windowSize)
+	log.Printf("Wating for first %d values to calculate the first window...", windowSize)
 
-	// Goroutine for getting the data
+	// Goroutine for getting the data from websocket
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			// Unmarshall message
-			_, message, err := w.ReadMessage()
-			if err != nil {
-				log.Fatal("Error reading message from WebSocket:", err)
-			}
-			var apiResponse APIResponse
-			err = json.Unmarshal(message, &apiResponse)
-			if err != nil {
-				log.Println("Error unmarshalling JSON:", err)
-				continue
-			}
-
-			if len(apiResponse.Data) == 0 {
-				log.Println("Empty trade data")
-				continue
-			}
-
-			// Send to channel
-			if apiResponse.Type == "trade" {
-				for _, data := range apiResponse.Data {
-					switch data.Symbol {
-					case "BINANCE:BTCUSDT":
-						btcChan <- data
-					case "BINANCE:ETHUSDT":
-						ethChan <- data
-					case "BINANCE:LTCUSDT":
-						ltcChan <- data
-					}
-				}
-			}
-		}
-	}()
+	go getCryptoData(w, btcChan, ethChan, ltcChan, &wg)
 
 	// Goroutines for batch processing
 	wg.Add(1)
@@ -165,18 +176,7 @@ func main() {
 	go calculateMovingAverage("LTC", ltcChan, dbChan, ltcWindowBatch, &wg)
 
 	// Goroutine for saving to DB
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			ma := <-dbChan
-
-			err := saveToDB(ma.currency, ma.value, ma.calculatedAt, db)
-			if err != nil {
-				log.Println("Error saving to database:", err)
-			}
-		}
-	}()
+	go saveToDB(dbChan, db, &wg)
 
 	// Wait for all goroutines to finish
 	wg.Wait()
